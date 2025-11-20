@@ -1,0 +1,5 @@
+{
+  "name": "TradeBrain AI",
+  "description": "An autonomous AI trading bot that monitors market data, maintains a local RAG knowledge base, and uses Gemini 2.5 Flash to execute trading strategies on a simulated or real Alpaca account.",
+  "requestFramePermissions": []
+}
