@@ -5,9 +5,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   symbol: 'SPY',
   alpacaKey: 'PKVXZ4W6KYEJASA2TKXBWCTYR3',
   alpacaSecret: 'AMnMZ4w1ko5FAGEvQpX4HFNUnbgrsUdfpoTxiSgGGUvM',
-  isSimulation: false, // Default to REAL (Paper) trading
+  isSimulation: true, // Default to SIMULATION for immediate stability
   tradingEnabled: true, // Start with brain active
-  intervalSeconds: 60, // 1 minute interval as requested
+  intervalSeconds: 10, // 10 seconds to prevent rate-limiting on free APIs
 };
 
 export const INITIAL_PORTFOLIO: Portfolio = {

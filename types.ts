@@ -17,6 +17,7 @@ export interface Portfolio {
   positions: Record<string, number>; 
   equity: number;
   initialBalance: number;
+  avgEntryPrice?: Record<string, number>;
 }
 
 export interface TradeDecision {
@@ -43,6 +44,8 @@ export interface RAGDocument {
     timestamp: number;
     price: number;
     trend: 'UP' | 'DOWN' | 'FLAT';
+    changePercent?: number;
+    volatility?: number;
   };
 }
 
@@ -71,4 +74,12 @@ export interface AlpacaAccount {
   cash: string;
   buying_power: string;
   currency: string;
+}
+
+export interface TradeOutcome {
+  symbol: string;
+  profit: number;
+  percent: number;
+  heldDurationSeconds: number;
+  timestamp: number;
 }

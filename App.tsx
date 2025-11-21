@@ -13,13 +13,15 @@ import { SettingsModal } from './components/SettingsModal';
 const App: React.FC = () => {
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [portfolio, setPortfolio] = useState<Portfolio>(INITIAL_PORTFOLIO);
-  const [startOfDayEquity, setStartOfDayEquity] = useState<number>(100000); // Defaults, will update from Alpaca
+  const [startOfDayEquity, setStartOfDayEquity] = useState<number>(100000); 
   
   // UI State
   const [activeScanner, setActiveScanner] = useState<MarketData[]>([]); 
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [lastOrder, setLastOrder] = useState<LastOrder | null>(null);
+  const [alpacaStatus, setAlpacaStatus] = useState<'CONNECTED' | 'ERROR' | 'SIM'>('SIM');
+  const [isLoading, setIsLoading] = useState(true);
   
   const configRef = useRef(config);
   const portfolioRef = useRef(portfolio);
@@ -37,6 +39,15 @@ const App: React.FC = () => {
     }]);
   }, []);
 
+  // Force switch to simulation if Alpaca fails critically
+  const switchToSim = useCallback((reason: string) => {
+      if (!configRef.current.isSimulation) {
+          addLog('WARNING', `Switching to Simulation Mode: ${reason}`);
+          setConfig(prev => ({ ...prev, isSimulation: true }));
+          setAlpacaStatus('SIM');
+      }
+  }, [addLog]);
+
   // Initial Sync with Alpaca
   useEffect(() => {
       const syncAlpaca = async () => {
@@ -46,21 +57,30 @@ const App: React.FC = () => {
                   const eq = parseFloat(account.equity);
                   const cash = parseFloat(account.cash);
                   
-                  setStartOfDayEquity(eq); // Assume start of session is reference point for "Day"
+                  setStartOfDayEquity(eq); 
                   setPortfolio({
                       cash: cash,
                       equity: eq,
-                      positions: {}, // We could fetch positions too, but keep simple for now
+                      positions: {}, 
                       initialBalance: eq
                   });
                   addLog('INFO', 'Connected to Alpaca Paper Account', { equity: eq, cash });
+                  setAlpacaStatus('CONNECTED');
               } catch (e: any) {
-                  addLog('ERROR', 'Failed to connect to Alpaca', { error: e.message });
+                  if (e.message === 'PERMANENT_FAILURE') {
+                      switchToSim("Alpaca Proxy not detected.");
+                  } else {
+                      addLog('ERROR', 'Failed to connect to Alpaca', { error: e.message });
+                      setAlpacaStatus('ERROR');
+                  }
               }
+          } else {
+              setAlpacaStatus('SIM');
           }
+          setIsLoading(false);
       };
       syncAlpaca();
-  }, [config.alpacaKey, config.isSimulation, addLog, config]);
+  }, [config.alpacaKey, config.isSimulation, addLog, config, switchToSim]);
 
   const executeBatchTrades = async (decisions: TradeDecision[]) => {
     const currentConfig = configRef.current;
@@ -138,16 +158,20 @@ const App: React.FC = () => {
                 }
             }
         } catch (err: any) {
-            addLog('ERROR', `Trade Execution Failed for ${d.symbol}`, err.message);
-            setLastOrder({
-                id: crypto.randomUUID(),
-                symbol: d.symbol,
-                action: d.action,
-                qty: d.quantity,
-                status: 'FAILED',
-                error: err.message,
-                timestamp: Date.now()
-            });
+            if (err.message === 'PERMANENT_FAILURE') {
+                switchToSim("Lost connection to Proxy during trade.");
+            } else {
+                addLog('ERROR', `Trade Execution Failed for ${d.symbol}`, err.message);
+                setLastOrder({
+                    id: crypto.randomUUID(),
+                    symbol: d.symbol,
+                    action: d.action,
+                    qty: d.quantity,
+                    status: 'FAILED',
+                    error: err.message,
+                    timestamp: Date.now()
+                });
+            }
         }
     }
 
@@ -169,64 +193,93 @@ const App: React.FC = () => {
                 ...prev,
                 equity: parseFloat(account.equity),
                 cash: parseFloat(account.cash),
-                initialBalance: parseFloat(account.equity) // Simplified logic
+                initialBalance: parseFloat(account.equity) 
             }));
-        } catch(e) {}
+            setAlpacaStatus('CONNECTED');
+        } catch(e: any) {
+            if (e.message === 'PERMANENT_FAILURE') switchToSim("Proxy failed during refresh.");
+            else setAlpacaStatus('ERROR');
+        }
     }
   };
 
   const runScannerLoop = useCallback(async () => {
     const currentConfig = configRef.current;
     
-    // 1. SCAN
-    const scanResults = await scanMarketBatch(10, currentConfig);
-    
-    // Ensure we get data for owned assets
-    const ownedSymbols = Object.keys(portfolioRef.current.positions);
-    for (const owned of ownedSymbols) {
-        if (!scanResults.find(s => s.symbol === owned)) {
-             const price = await fetchMarketPrice(owned, currentConfig);
-             scanResults.push(price);
+    try {
+        // 1. SCAN
+        const scanResults = await scanMarketBatch(10, currentConfig);
+        
+        // Ensure we get data for owned assets
+        const ownedSymbols = Object.keys(portfolioRef.current.positions);
+        for (const owned of ownedSymbols) {
+            if (!scanResults.find(s => s.symbol === owned)) {
+                try {
+                    const price = await fetchMarketPrice(owned, currentConfig);
+                    scanResults.push(price);
+                } catch (e: any) {
+                    if (e.message === 'PERMANENT_FAILURE') throw e;
+                    console.warn(`Could not fetch price for owned asset ${owned}`);
+                }
+            }
+        }
+        setActiveScanner(scanResults);
+
+        // 2. MEMORIZE
+        scanResults.forEach(data => ragService.addRecord(data));
+
+        // 3. BRAIN
+        if (currentConfig.tradingEnabled) {
+            const candidates = scanResults.filter(d => 
+                Math.abs(d.changePercent || 0) > 0.05 || 
+                portfolioRef.current.positions[d.symbol]
+            );
+
+            if (candidates.length > 0) {
+                const symbols = candidates.map(c => c.symbol);
+                const ragContext = ragService.getBatchContext(symbols);
+                
+                addLog('BRAIN', `AI Analyzing ${candidates.length} assets...`);
+                
+                const decisions = await getBrainBatchDecision(candidates, ragContext, portfolioRef.current);
+                const validTrades = decisions.filter(d => d.action !== TradeAction.HOLD);
+                
+                if (validTrades.length > 0) {
+                    await executeBatchTrades(validTrades);
+                } 
+            }
+        }
+    } catch (err: any) {
+        if (err.message === 'PERMANENT_FAILURE') {
+            switchToSim("Proxy connection lost during scanner loop.");
+        } else {
+            console.error("Critical Scanner Loop Error:", err);
+            addLog('ERROR', 'Scanner Loop Crashed (Auto-Recovering)', err.message);
         }
     }
-    setActiveScanner(scanResults);
-
-    // 2. MEMORIZE
-    scanResults.forEach(data => ragService.addRecord(data));
-
-    // 3. BRAIN
-    if (currentConfig.tradingEnabled) {
-        const candidates = scanResults.filter(d => 
-            Math.abs(d.changePercent || 0) > 0.05 || 
-            portfolioRef.current.positions[d.symbol]
-        );
-
-        if (candidates.length > 0) {
-            const symbols = candidates.map(c => c.symbol);
-            const ragContext = ragService.getBatchContext(symbols);
-            
-            addLog('BRAIN', `AI Analyzing ${candidates.length} assets...`);
-            
-            const decisions = await getBrainBatchDecision(candidates, ragContext, portfolioRef.current);
-            const validTrades = decisions.filter(d => d.action !== TradeAction.HOLD);
-            
-            if (validTrades.length > 0) {
-                await executeBatchTrades(validTrades);
-            } 
-        }
-    }
-  }, [addLog]);
+  }, [addLog, switchToSim]);
 
   // Main Loop
   useEffect(() => {
-    runScannerLoop();
+    if (isLoading) return; // Wait for initialization
 
+    runScannerLoop();
     const intervalId = setInterval(() => {
       runScannerLoop();
     }, config.intervalSeconds * 1000); 
 
     return () => clearInterval(intervalId);
-  }, [config.intervalSeconds, runScannerLoop]);
+  }, [config.intervalSeconds, runScannerLoop, isLoading]);
+
+  if (isLoading) {
+      return (
+          <div className="min-h-screen bg-gray-950 flex items-center justify-center flex-col">
+              <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+              <h2 className="text-xl font-mono text-blue-400">Initializing TradeBrain AI...</h2>
+              <p className="text-gray-500 text-sm mt-2">Connecting to market feeds & neural networks</p>
+          </div>
+      );
+  }
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 p-4 md:p-8 font-sans selection:bg-blue-500 selection:text-white">
@@ -239,9 +292,18 @@ const App: React.FC = () => {
              </div>
              TRADEBRAIN AI
            </h1>
-           <p className="text-gray-500 text-sm mt-1 font-mono">
-             {config.isSimulation ? 'SIMULATION MODE' : 'REAL ALPACA PAPER TRADING'}
-           </p>
+           <div className="flex items-center gap-2 mt-1">
+             <span className={`px-2 py-0.5 text-[10px] rounded font-bold ${
+                 alpacaStatus === 'CONNECTED' ? 'bg-green-900 text-green-300' : 
+                 alpacaStatus === 'ERROR' ? 'bg-red-900 text-red-300' : 
+                 'bg-blue-900 text-blue-300'
+             }`}>
+                 {alpacaStatus === 'CONNECTED' ? 'ALPACA ONLINE' : alpacaStatus === 'ERROR' ? 'CONNECTION ERROR' : 'SIMULATION'}
+             </span>
+             <p className="text-gray-500 text-sm font-mono">
+               {config.isSimulation ? 'SIMULATION MODE' : 'PAPER TRADING'}
+             </p>
+           </div>
         </div>
         
         <button 

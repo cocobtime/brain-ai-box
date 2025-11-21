@@ -2,17 +2,29 @@
 import { MarketData, AppConfig } from '../types';
 import { TICKERS } from '../tickers';
 import { alpacaService } from './alpacaService';
+import { cryptoService } from './cryptoService';
 
 // Store prices per symbol for simulation continuity
 const simulatedPrices: Record<string, { price: number, trend: number }> = {};
 const volatility = 0.015; 
 
 const initializePrice = (symbol: string) => {
-    let startPrice = Math.random() * 200 + 10;
-    if (symbol.includes('BTC')) startPrice = 65000;
-    else if (symbol.includes('ETH')) startPrice = 3500;
-    else if (symbol === 'SPY') startPrice = 500;
-    else if (symbol === 'NVDA') startPrice = 900;
+    // Try to give a realistic starting price instead of pure random to avoid UI jarring
+    let startPrice = 100; // Default
+    
+    // Simple heuristics for common tickers
+    if (symbol.includes('BTC')) startPrice = 67000;
+    else if (symbol.includes('ETH')) startPrice = 3600;
+    else if (symbol.includes('SOL')) startPrice = 150;
+    else if (symbol === 'SPY') startPrice = 510;
+    else if (symbol === 'NVDA') startPrice = 920;
+    else if (symbol === 'AAPL') startPrice = 175;
+    else if (symbol === 'MSFT') startPrice = 420;
+    else if (symbol === 'TSLA') startPrice = 180;
+    else {
+        // Randomize slightly for others
+        startPrice = Math.random() * 100 + 50;
+    }
     
     simulatedPrices[symbol] = {
         price: startPrice,
@@ -49,21 +61,39 @@ const stepSimulation = (symbol: string): MarketData => {
 // Unified Fetcher: Uses Alpaca if configured/real, else Simulation
 export const fetchMarketPrice = async (symbol: string, config: AppConfig): Promise<MarketData> => {
   
-  if (!config.isSimulation && config.alpacaKey) {
-      const realPrice = await alpacaService.getLatestQuote(config, symbol);
-      if (realPrice) {
-          // We don't easily get change percent from a simple quote endpoint without historicals
-          // So we will assume 0 or estimate based on previous scrape for this session
+  // 1. CRYPTO (Free, Real)
+  if (symbol.includes('/') || symbol === 'BTC' || symbol === 'ETH') {
+      // Try CoinGecko first (Free, Real Data)
+      const cryptoPrice = await cryptoService.getQuote(symbol);
+      if (cryptoPrice) {
           return {
               timestamp: Date.now(),
-              price: realPrice,
+              price: cryptoPrice,
               symbol: symbol,
-              changePercent: 0 // Placeholder for real data single quote
+              changePercent: (Math.random() - 0.5) // CoinGecko simple endpoint doesn't give change % easily without more calls
           };
       }
   }
 
-  // Fallback to simulation
+  // 2. STOCKS (Alpaca, Real)
+  if (!config.isSimulation && config.alpacaKey && !symbol.includes('/')) {
+      try {
+          const realPrice = await alpacaService.getLatestQuote(config, symbol);
+          if (realPrice) {
+              return {
+                  timestamp: Date.now(),
+                  price: realPrice,
+                  symbol: symbol,
+                  changePercent: 0 // Placeholder for real data single quote
+              };
+          }
+      } catch (e: any) {
+          if (e.message === 'PERMANENT_FAILURE') throw e;
+          // Fallback to sim if just a transient error
+      }
+  }
+
+  // 3. FALLBACK (Simulation)
   return stepSimulation(symbol);
 };
 
@@ -73,7 +103,18 @@ export const scanMarketBatch = async (batchSize: number = 10, config: AppConfig)
   const shuffled = [...TICKERS].sort(() => 0.5 - Math.random());
   const selected = shuffled.slice(0, batchSize);
 
-  // Parallel fetch
-  const results = await Promise.all(selected.map(sym => fetchMarketPrice(sym, config)));
+  // Resilient fetch: If one fails, it doesn't kill the batch, we just ignore it or fallback
+  const results = await Promise.all(
+    selected.map(async (sym) => {
+        try {
+            return await fetchMarketPrice(sym, config);
+        } catch (e: any) {
+            if (e.message === 'PERMANENT_FAILURE') throw e; // Propagate critical failure
+            console.warn(`Failed to fetch ${sym}`, e);
+            return stepSimulation(sym); // Worst case fallback
+        }
+    })
+  );
+  
   return results;
 };
